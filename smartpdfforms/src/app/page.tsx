@@ -29,7 +29,10 @@ export default function Home() {
   const setPdfFile = useFormStore((s) => s.setPdfFile);
   const setFields = useFormStore((s) => s.setFields);
   const setExtracting = useFormStore((s) => s.setExtracting);
+  const setExtractionMeta = useFormStore((s) => s.setExtractionMeta);
   const extracting = useFormStore((s) => s.extracting);
+  const usedOCR = useFormStore((s) => s.usedOCR);
+  const modelInfo = useFormStore((s) => s.modelInfo);
 
   const [error, setError] = useState<string | null>(null);
   const [pageDimensions, setPageDimensions] = useState<PageDimensions[]>([]);
@@ -43,11 +46,12 @@ export default function Home() {
 
     try {
       const { extractFieldsFromPDF } = await import("@/lib/clientExtractor");
-      const { fields, pages } = await extractFieldsFromPDF(file, (p) => {
+      const { fields, pages, usedOCR: didOCR, modelInfo: meta } = await extractFieldsFromPDF(file, (p) => {
         setOcrProgress(p);
       });
       setPageDimensions(pages);
       setFields(fields);
+      setExtractionMeta(didOCR, meta ?? null);
     } catch (err) {
       console.error(err);
       setError(err instanceof Error ? err.message : "Failed to extract fields from PDF");
@@ -66,8 +70,15 @@ export default function Home() {
           Smart PDF Forms
         </h1>
         <span className="ml-2 text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full font-medium">
-          Phase 1 – PDF.js + OCR
+          {usedOCR
+            ? `HuggingFace TrOCR${modelInfo?.device ? ` (${modelInfo.device})` : ""}`
+            : "PDF.js"}
         </span>
+        {usedOCR && modelInfo?.printed && (
+          <span className="text-xs text-gray-400 hidden sm:block truncate max-w-xs" title={modelInfo.printed}>
+            {modelInfo.printed.split("/").pop()}
+          </span>
+        )}
       </header>
 
       {/* Content */}
@@ -87,7 +98,7 @@ export default function Home() {
                     Upload a Bank PDF Form
                   </h2>
                   <p className="text-sm text-gray-500 mt-1">
-                    Supports digital PDFs and scanned forms (OCR)
+                    Supports digital PDFs and scanned/handwritten forms (HuggingFace TrOCR)
                   </p>
                 </div>
                 <PDFUploader onUpload={handleUpload} />
@@ -117,7 +128,7 @@ export default function Home() {
                         <ScanLine className="w-9 h-9 text-blue-500 animate-pulse" />
                         <div className="w-full max-w-xs text-center">
                           <p className="text-sm font-semibold text-gray-700 mb-1">
-                            OCR — Page {ocrProgress.page} of {ocrProgress.totalPages}
+                            HF TrOCR — Page {ocrProgress.page} of {ocrProgress.totalPages}
                           </p>
                           <p className="text-xs text-gray-400 mb-3 capitalize">
                             {ocrProgress.status}
@@ -132,7 +143,7 @@ export default function Home() {
                             />
                           </div>
                           <p className="text-xs text-gray-400 mt-2">
-                            {ocrProgress.progress}% — first run downloads ~10MB language model
+                            {ocrProgress.progress}% — first run downloads HF models (~1GB)
                           </p>
                         </div>
                       </>

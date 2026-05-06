@@ -11,6 +11,7 @@ export interface RawTextItem {
   width: number;
   height: number;
   page: number;
+  confidence?: number;  // 0–1, from EasyOCR; low values indicate handwriting
 }
 
 export interface PageDimensions {

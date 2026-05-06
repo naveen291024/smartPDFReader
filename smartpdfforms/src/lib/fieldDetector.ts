@@ -18,9 +18,10 @@ import type { RawTextItem, PageDimensions } from "./pdfExtractor";
 import type { FormField, FieldType, BoundingBox } from "@/store/formStore";
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
-const Y_TOLERANCE    = 18;   // px  – same-row Y spread (larger for uneven handwriting)
-const WORD_MERGE_GAP = 35;   // px  – max gap to merge adjacent words (handwriting is spread out)
-const COL_GAP_MIN    = 8;    // px  – min gap separating label from value (small for handwritten forms)
+const Y_TOLERANCE    = 14;   // px  – same-row Y spread
+const WORD_MERGE_GAP = 12;   // px  – max gap to merge adjacent words into one phrase token
+                              //        (kept small to avoid merging labels with adjacent values)
+const COL_GAP_MIN    = 8;    // px  – min gap separating label from value
 const NEXT_ROW_MAX   = 90;   // px  – max vertical distance for label-above-value match
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -151,6 +152,21 @@ function isBlankPlaceholder(text: string): boolean {
   // Mostly underscores / dashes (OCR sometimes mixes in noise chars)
   const nonBlank = t.replace(/[_\-\.\s\|\u2500-\u257F\+]/g, "");
   if (t.length >= 3 && nonBlank.length / t.length < 0.25) return true;
+  // Character-entry box artefacts: OCR reads the borders of printed letter-entry
+  // boxes as repeating letters like FTFTTTTFTTT, LLLLL, IIIIIII, PIDEI, BIZTEDI.
+  // Detect: string of 4+ chars where unique char count ≤ 3 AND all chars are
+  // common box-border OCR misreads (F, T, L, I, |, [, ], E, B, P, D, Z)
+  if (t.length >= 4) {
+    const unique = new Set(t.toUpperCase().replace(/\s/g, ""));
+    const boxChars = /^[FTLIEB|\[\]PD{}Z0O\-_]+$/i.test(t.replace(/\s/g, ""));
+    if (boxChars && unique.size <= 4) return true;
+    // High repetition ratio: same 1-2 chars make up > 70% of the string
+    const chars = t.replace(/\s/g, "");
+    const topChar = [...unique].sort((a, b) =>
+      (chars.split(b).length - 1) - (chars.split(a).length - 1)
+    )[0];
+    if (topChar && chars.split(topChar).length - 1 >= chars.length * 0.6 && chars.length >= 5) return true;
+  }
   return false;
 }
 
@@ -194,9 +210,35 @@ function isDigitBoxToken(text: string): boolean {
 }
 
 /**
+ * True if a row token is a section heading that provides GROUP context for
+ * sub-fields below it, but is not itself a fillable field.
+ * Examples: "1. *Applicant's Name", "2. *ATM Card required", "3. Please provide"
+ */
+function isSectionHeading(text: string): boolean {
+  const t = text.trim();
+  // Numbered section: starts with digit(s), dot, optional star/asterisk
+  if (/^\d+\.\s*[*'\u2018\u2019]?\s*[A-Z]/i.test(t)) return true;
+  // Starred mandatory section marker: "*Applicant's Name"
+  if (/^[*\u2022]\s*[A-Z]/i.test(t) && t.split(/\s+/).length <= 5) return true;
+  return false;
+}
+
+/**
+ * Extract clean section heading text (strip leading number, dot, star).
+ * e.g. "1. *Applicant's Name" → "Applicant's Name"
+ */
+function sectionHeadingLabel(text: string): string {
+  return text
+    .replace(/^\d+\.\s*/, "")
+    .replace(/^[*\u2022]\s*/, "")
+    .replace(/:+$/, "")
+    .trim();
+}
+/**
  * Try to split a merged token into (labelPart, valuePart) using KNOWN_LABEL_PHRASES.
  * Returns null if no known label prefix is found.
  * Handles both "First Name John" and "First Name: John" formats.
+ * Also catches "CIF ID 98765432" or "Mobile Number 9876543210".
  */
 function splitOnKnownLabel(text: string): { label: string; value: string } | null {
   const t = text.trim();
@@ -233,6 +275,43 @@ function isLikelyLabel(text: string): boolean {
   return FORM_LABEL_KEYWORDS.some((kw) => lower.includes(kw));
 }
 
+/** Confidence below this is treated as handwritten (matches backend HW_CONFIDENCE_THRESHOLD) */
+const HW_CONFIDENCE_THRESHOLD = 0.75;
+
+/**
+ * Returns true if a row contains at least one token that is either:
+ *  a) a low-confidence handwritten item (confidence < HW_CONFIDENCE_THRESHOLD), OR
+ *  b) a plausible non-label value token
+ * Starting search from `startIdx` (tokens before the label are excluded).
+ * This is used to distinguish genuine form fields (always have a fill-in slot)
+ * from section headings / instruction text (never do).
+ */
+function hasHandwrittenOrValueOnRow(row: Row, startIdx: number): boolean {
+  for (let i = startIdx; i < row.tokens.length; i++) {
+    const tok = row.tokens[i];
+    // Low-confidence = handwritten text in the value slot
+    if (tok.confidence !== undefined && tok.confidence < HW_CONFIDENCE_THRESHOLD) return true;
+    // Blank placeholder (empty input box) still signals a fillable field
+    if (isBlankPlaceholder(tok.text)) return true;
+    // Digit-box artefacts = empty number boxes
+    if (isDigitBoxToken(tok.text)) return true;
+    // A real value token (not another label)
+    if (isLikelyValue(tok.text) && !isLikelyLabel(tok.text)) return true;
+  }
+  return false;
+}
+
+/** Same check but working across two rows (label row + value row below it). */
+function hasHandwrittenOrValueBelow(valueRow: Row): boolean {
+  return valueRow.tokens.some(
+    (tok) =>
+      (tok.confidence !== undefined && tok.confidence < HW_CONFIDENCE_THRESHOLD) ||
+      isBlankPlaceholder(tok.text) ||
+      isDigitBoxToken(tok.text) ||
+      (isLikelyValue(tok.text) && !isLikelyLabel(tok.text))
+  );
+}
+
 function isLikelyValue(text: string): boolean {
   const t = text.trim();
   if (!t || t.length < 1) return false;
@@ -244,6 +323,42 @@ function isLikelyValue(text: string): boolean {
 }
 
 // ── Word grouping and merging ─────────────────────────────────────────────────
+
+/**
+ * Deduplicate raw text items from two-pass OCR scanning.
+ * Removes items whose bounding box centre is within 20px of another item
+ * that has the same or very similar text. Keeps the item with longer text.
+ */
+function deduplicateItems(items: RawTextItem[]): RawTextItem[] {
+  const kept: RawTextItem[] = [];
+  for (const item of items) {
+    const cx = item.x + item.width / 2;
+    const cy = item.y + item.height / 2;
+    const isDuplicate = kept.some((k) => {
+      const kx = k.x + k.width / 2;
+      const ky = k.y + k.height / 2;
+      if (Math.abs(kx - cx) > 20 || Math.abs(ky - cy) > 20) return false;
+      // Same centre — check text similarity (match if either starts with the other)
+      const a = item.text.trim().toLowerCase().slice(0, 6);
+      const b = k.text.trim().toLowerCase().slice(0, 6);
+      return a === b || a.startsWith(b) || b.startsWith(a);
+    });
+    if (!isDuplicate) {
+      // If a near-duplicate already exists, replace if current text is longer
+      const nearIdx = kept.findIndex((k) => {
+        const kx = k.x + k.width / 2;
+        const ky = k.y + k.height / 2;
+        return Math.abs(kx - cx) <= 20 && Math.abs(ky - cy) <= 20;
+      });
+      if (nearIdx >= 0 && item.text.length > kept[nearIdx].text.length) {
+        kept[nearIdx] = item;
+      } else if (nearIdx < 0) {
+        kept.push(item);
+      }
+    }
+  }
+  return kept;
+}
 
 interface Row {
   tokens: RawTextItem[];  // merged phrase tokens (not raw OCR words)
@@ -312,8 +427,11 @@ function buildRows(items: RawTextItem[]): Row[] {
       if (last) {
         const gap = word.x - (last.x + last.width);
         if (gap <= WORD_MERGE_GAP) {
-          // Merge into last token
+          // Merge into last token — take the minimum confidence (handwriting lowers it)
           const mergedText = last.text + " " + word.text;
+          const mergedConf = (last.confidence !== undefined && word.confidence !== undefined)
+            ? Math.min(last.confidence, word.confidence)
+            : (last.confidence ?? word.confidence);
           tokens[tokens.length - 1] = {
             text: mergedText,
             x: last.x,
@@ -321,6 +439,7 @@ function buildRows(items: RawTextItem[]): Row[] {
             width: (word.x + word.width) - last.x,
             height: Math.max(last.height, word.height),
             page: last.page,
+            confidence: mergedConf,
           };
           continue;
         }
@@ -340,7 +459,8 @@ function makeField(
   rawValue: string,
   bbox: BoundingBox,
   usedIds: Set<string>,
-  forceCreate = false   // true → create even with empty value (blank/box fields)
+  forceCreate = false,
+  valueConfidence?: number,
 ): FormField | null {
   const cleanLabel = label.replace(/:+$/, "").trim();
   if (!cleanLabel) return null;
@@ -368,7 +488,10 @@ function makeField(
     value = ["yes", "true", "y", "✓", "☑", "1"].includes(rawValue.toLowerCase().trim());
   }
 
-  return { id, label: cleanLabel, type, value, options, bbox, required: true };
+  return { id, label: cleanLabel, type, value, options, bbox, required: true,
+    valueConfidence,
+    isHandwritten: valueConfidence !== undefined && valueConfidence < 0.75,
+  };
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -377,7 +500,11 @@ export function detectFields(
   items: RawTextItem[],
   pages: PageDimensions[]
 ): FormField[] {
-  const rows = buildRows(items);
+  // ── Pre-step: deduplicate near-identical items from two-pass OCR ──────────
+  // Pass 1 and Pass 2 produce items at nearly the same coordinates with
+  // the same (or nearly same) text. Keep only the best one per position.
+  const dedupedItems = deduplicateItems(items);
+  const rows = buildRows(dedupedItems);
   const fields: FormField[] = [];
   const usedIds = new Set<string>();
 
@@ -530,7 +657,7 @@ export function detectFields(
         height: token.height + 4,
       };
 
-      const field = makeField(labelPart, valuePart, bbox, usedIds);
+      const field = makeField(labelPart, valuePart, bbox, usedIds, false, token.confidence);
       if (field) fields.push(field);
     }
   }
@@ -557,7 +684,7 @@ export function detectFields(
         height: token.height + 4,
       };
 
-      const field = makeField(split.label, split.value, bbox, usedIds);
+      const field = makeField(split.label, split.value, bbox, usedIds, false, token.confidence);
       if (field) fields.push(field);
     }
   }
@@ -583,6 +710,9 @@ export function detectFields(
       const labelText = labelTok.text.replace(/:+$/, "").trim();
 
       if (usedIds.has(slugify(labelText))) continue;
+
+      // Skip label token and look for handwritten neighbour on same row
+      if (!hasHandwrittenOrValueOnRow(row, labelIdx + 1)) continue;
 
       // Examine tokens between this label and the next label
       const betweenToks = row.tokens.slice(labelIdx + 1, nextLabelIdx);
@@ -679,7 +809,7 @@ export function detectFields(
         };
       }
 
-      const field = makeField(labelText, valueText, valueBbox!, usedIds, /* forceCreate */ true);
+      const field = makeField(labelText, valueText, valueBbox!, usedIds, /* forceCreate */ true, valueTok?.confidence);
       if (field) {
         if (isDigitBoxField) field.type = "number";
         fields.push(field);
@@ -772,6 +902,9 @@ export function detectFields(
       const labelText = labelTok.text.replace(/:+$/, "").trim();
       if (usedIds.has(slugify(labelText))) continue;
 
+      // Only create field if value row has a handwritten/value token
+      if (!hasHandwrittenOrValueBelow(valueRow)) continue;
+
       // Find best matching value token in next row (prefer x-aligned, fallback to first)
       const aligned = valueRow.tokens.find((vt) => {
         if (!isLikelyValue(vt.text)) return false;
@@ -791,7 +924,7 @@ export function detectFields(
         height: valueTok.height + 4,
       };
 
-      const field = makeField(labelText, valueTok.text, bbox, usedIds);
+      const field = makeField(labelText, valueTok.text, bbox, usedIds, false, valueTok.confidence);
       if (field) fields.push(field);
     }
   }
@@ -803,6 +936,8 @@ export function detectFields(
 
     if (row.page !== nextRow.page) continue;
     if (nextRow.y - row.y > NEXT_ROW_MAX) continue;
+    // Require handwritten/value content below before creating field
+    if (!hasHandwrittenOrValueBelow(nextRow)) continue;
 
     for (const tok of row.tokens) {
       if (!tok.text.endsWith(":")) continue;
@@ -820,11 +955,81 @@ export function detectFields(
         height: valueTok.height + 4,
       };
 
-      const field = makeField(labelText, valueTok.text, bbox, usedIds);
+      const field = makeField(labelText, valueTok.text, bbox, usedIds, false, valueTok.confidence);
+      if (field) fields.push(field);
+    }
+  }
+
+  // ── Strategy F: Value-above-label (inverted layout) ──────────────────────────
+  // Handles forms where the printable character-box row appears ABOVE the label,
+  // e.g.:
+  //   [F][T][F][T][T][T]   ← OCR of printed character entry boxes (y=230)
+  //   First Name            ← label (y=240)
+  // For each label token not yet claimed, look at the row immediately ABOVE.
+  // If that row contains box/handwriting/blank tokens, use it as the value.
+  for (let ri = 1; ri < rows.length; ri++) {
+    const labelRow = rows[ri];
+    const aboveRow = rows[ri - 1];
+
+    if (labelRow.page !== aboveRow.page) continue;
+    const vertGap = labelRow.y - aboveRow.y;
+    if (vertGap < 0 || vertGap > NEXT_ROW_MAX) continue;
+
+    for (const labelTok of labelRow.tokens) {
+      if (!isLikelyLabel(labelTok.text)) continue;
+
+      const rawLabel = labelTok.text.replace(/:+$/, "").trim();
+      if (usedIds.has(slugify(rawLabel))) continue;
+
+      // The above row must contain box/handwritten content
+      const aboveHasBoxOrHW = aboveRow.tokens.some(
+        (t) =>
+          isBlankPlaceholder(t.text) ||
+          isDigitBoxToken(t.text) ||
+          (t.confidence !== undefined && t.confidence < 0.75)
+      );
+      if (!aboveHasBoxOrHW) continue;
+
+      // Find the best value token in the above row — prefer handwritten over blank
+      const hwTok = aboveRow.tokens.find(
+        (t) => t.confidence !== undefined && t.confidence < 0.75 && !isBlankPlaceholder(t.text)
+      );
+      const boxTok = aboveRow.tokens.find(
+        (t) => isBlankPlaceholder(t.text) || isDigitBoxToken(t.text)
+      );
+      const valueTok = hwTok ?? boxTok ?? null;
+
+      // Determine section context — find the nearest section heading above
+      let sectionCtx = "";
+      for (let si = ri - 1; si >= 0; si--) {
+        const sRow = rows[si];
+        if (sRow.page !== labelRow.page) break;
+        const heading = sRow.tokens.find((t) => isSectionHeading(t.text));
+        if (heading) { sectionCtx = sectionHeadingLabel(heading.text); break; }
+        if (labelRow.y - sRow.y > 150) break;  // don't look too far up
+      }
+
+      const displayLabel = sectionCtx
+        ? `${sectionCtx} — ${rawLabel}`
+        : rawLabel;
+
+      const anchor = valueTok ?? labelTok;
+      const valueBbox: BoundingBox = {
+        page: aboveRow.page,
+        x: anchor.x,
+        y: anchor.y - anchor.height,
+        width: Math.max(anchor.width, 120),
+        height: anchor.height + 4,
+      };
+
+      const valueText = (valueTok && !isBlankPlaceholder(valueTok.text) && !isDigitBoxToken(valueTok.text))
+        ? valueTok.text
+        : "";
+
+      const field = makeField(displayLabel, valueText, valueBbox, usedIds, true, valueTok?.confidence);
       if (field) fields.push(field);
     }
   }
 
   return fields;
 }
-

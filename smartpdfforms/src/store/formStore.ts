@@ -18,6 +18,8 @@ export interface FormField {
   options?: string[];           // for select fields
   bbox: BoundingBox;
   required?: boolean;
+  isHandwritten?: boolean;      // true when value was written by hand (low OCR confidence)
+  valueConfidence?: number;     // raw OCR confidence for the value token (0–1)
 }
 
 export interface FormErrors {
@@ -44,6 +46,10 @@ interface FormState {
   // Loading state while extraction runs
   extracting: boolean;
 
+  // Extraction metadata (populated after each extraction)
+  usedOCR: boolean;
+  modelInfo: Record<string, string> | null;
+
   // Actions
   setPdfFile: (file: File) => void;
   setFields: (fields: FormField[]) => void;
@@ -51,6 +57,7 @@ interface FormState {
   setActiveField: (id: string | null) => void;
   setExtracting: (value: boolean) => void;
   setErrors: (errors: FormErrors) => void;
+  setExtractionMeta: (usedOCR: boolean, modelInfo: Record<string, string> | null) => void;
   resetForm: () => void;
 }
 
@@ -62,6 +69,8 @@ export const useFormStore = create<FormState>((set) => ({
   activeFieldId: null,
   errors: {},
   extracting: false,
+  usedOCR: false,
+  modelInfo: null,
 
   setPdfFile: (file) =>
     set({
@@ -95,6 +104,8 @@ export const useFormStore = create<FormState>((set) => ({
 
   setErrors: (errors) => set({ errors }),
 
+  setExtractionMeta: (usedOCR, modelInfo) => set({ usedOCR, modelInfo }),
+
   resetForm: () =>
     set({
       pdfFile: null,
@@ -104,5 +115,7 @@ export const useFormStore = create<FormState>((set) => ({
       activeFieldId: null,
       errors: {},
       extracting: false,
+      usedOCR: false,
+      modelInfo: null,
     }),
 }));

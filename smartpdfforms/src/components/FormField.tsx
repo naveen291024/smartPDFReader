@@ -1,6 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { PenLine, Type } from "lucide-react";
 import type { FormField as FormFieldType } from "@/store/formStore";
 import { cn } from "@/lib/utils";
 
@@ -41,8 +42,21 @@ export function FormField({
       )}
     >
       <label htmlFor={field.id} className={labelBase}>
-        {field.label}
-        {field.required && <span className="text-red-400 ml-0.5">*</span>}
+        <span className="flex items-center gap-1.5">
+          {field.label}
+          {field.required && <span className="text-red-400">*</span>}
+          {field.isHandwritten ? (
+            <span className="inline-flex items-center gap-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600 border border-amber-200">
+              <PenLine className="w-2.5 h-2.5" />
+              handwritten
+            </span>
+          ) : field.valueConfidence !== undefined ? (
+            <span className="inline-flex items-center gap-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-green-50 text-green-700 border border-green-200">
+              <Type className="w-2.5 h-2.5" />
+              printed
+            </span>
+          ) : null}
+        </span>
       </label>
 
       {/* TEXT */}

@@ -1,0 +1,25 @@
+# SmartPDFForms – Python OCR backend dependencies
+# Install: pip install -r requirements.txt
+
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# PDF to image conversion (requires poppler — see README)
+pdf2image>=1.17.0
+
+# Image processing
+Pillow>=10.3.0
+numpy>=1.26.0
+
+# HuggingFace Transformers — TrOCR models
+transformers>=4.40.0
+torch>=2.2.0
+torchvision>=0.17.0
+accelerate>=0.29.0
+
+# EasyOCR — bounding box detection (feeds regions to TrOCR)
+easyocr>=1.7.1
+
+# Optional: GPU support — uncomment if using CUDA
+# torch>=2.2.0+cu121   (replace cpu torch install)
